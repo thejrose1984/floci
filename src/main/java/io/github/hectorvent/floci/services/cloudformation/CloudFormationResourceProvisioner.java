@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
+import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
@@ -345,6 +346,8 @@ public class CloudFormationResourceProvisioner {
                 case "AWS::EC2::Route" -> provisionRoute(resource, properties, engine, region);
                 case "AWS::EC2::NatGateway" -> provisionNatGateway(resource, properties, engine, region);
                 case "AWS::EC2::EIP" -> provisionEip(resource, region);
+                case "AWS::EC2::LaunchTemplate" ->
+                        provisionLaunchTemplate(resource, properties, engine, region, accountId, stackName);
                 case "AWS::KinesisFirehose::DeliveryStream" ->
                         provisionFirehoseDeliveryStream(resource, properties, engine, stackName);
                 case "AWS::EC2::Instance" -> provisionEc2Instance(resource, properties, engine, region);
@@ -479,6 +482,7 @@ public class CloudFormationResourceProvisioner {
             case "AWS::KinesisFirehose::DeliveryStream" -> firehoseService.deleteDeliveryStream(physicalId);
             case "AWS::EC2::SecurityGroup" -> ec2Service.deleteSecurityGroup(region, physicalId);
             case "AWS::EC2::Instance" -> ec2Service.terminateInstances(region, List.of(physicalId));
+            case "AWS::EC2::LaunchTemplate" -> deleteLaunchTemplateSafe(physicalId, region);
             case "AWS::RDS::DBInstance" -> rdsService.deleteDbInstance(physicalId);
             case "AWS::RDS::DBCluster" -> rdsService.deleteDbCluster(physicalId);
             case "AWS::RDS::DBSubnetGroup" -> rdsService.deleteDbSubnetGroup(physicalId);
@@ -838,20 +842,22 @@ public class CloudFormationResourceProvisioner {
             name = generatePhysicalName(stackName, r.getLogicalId(), 255, false);
         }
         String launchConfigName = resolveOptional(props, "LaunchConfigurationName", engine);
+        String launchTemplateId = null;
         String launchTemplateName = null;
         String launchTemplateVersion = null;
         if (props != null && props.has("LaunchTemplate")) {
             JsonNode lt = props.get("LaunchTemplate");
+            // Id and name are distinct lookup keys in Auto Scaling: passing an lt- id in the name slot
+            // never matches a stored template.
+            launchTemplateId = engine.resolve(lt.path("LaunchTemplateId"));
             launchTemplateName = engine.resolve(lt.path("LaunchTemplateName"));
-            if (launchTemplateName == null || launchTemplateName.isBlank()) {
-                launchTemplateName = engine.resolve(lt.path("LaunchTemplateId"));
-            }
             launchTemplateVersion = engine.resolve(lt.path("Version"));
         }
 
         var asg = autoScalingService.createAutoScalingGroup(region, name,
-                blankToNull(launchConfigName), null, blankToNull(launchTemplateName), blankToNull(launchTemplateVersion),
-                null,
+                blankToNull(launchConfigName),
+                blankToNull(launchTemplateId), blankToNull(launchTemplateName), blankToNull(launchTemplateVersion),
+                resolveMixedInstancesPolicy(props, engine),
                 parseIntProp(props, "MinSize", engine, 0),
                 parseIntProp(props, "MaxSize", engine, 0),
                 parseIntProp(props, "DesiredCapacity", engine, 0),
@@ -868,6 +874,66 @@ public class CloudFormationResourceProvisioner {
         // Ref returns the Auto Scaling group name; Fn::GetAtt Arn returns the ASG ARN.
         r.setPhysicalId(name);
         r.getAttributes().put("Arn", asg.getAutoScalingGroupArn());
+    }
+
+    /**
+     * Builds the {@code MixedInstancesPolicy} of an Auto Scaling group from template properties, in the
+     * same shape the Query API parser produces. Returns {@code null} when the property is absent, so
+     * that the group falls back to its {@code LaunchTemplate} or {@code LaunchConfigurationName}.
+     */
+    private MixedInstancesPolicy resolveMixedInstancesPolicy(JsonNode props,
+                                                             CloudFormationTemplateEngine engine) {
+        if (props == null || !props.has("MixedInstancesPolicy") || props.get("MixedInstancesPolicy").isNull()) {
+            return null;
+        }
+        JsonNode policyNode = props.get("MixedInstancesPolicy");
+        MixedInstancesPolicy policy = new MixedInstancesPolicy();
+
+        JsonNode launchTemplateNode = policyNode.path("LaunchTemplate");
+        if (launchTemplateNode.isObject()) {
+            MixedInstancesPolicy.LaunchTemplate launchTemplate = new MixedInstancesPolicy.LaunchTemplate();
+            JsonNode specNode = launchTemplateNode.path("LaunchTemplateSpecification");
+            if (specNode.isObject()) {
+                var specification = new MixedInstancesPolicy.LaunchTemplateSpecification();
+                specification.setLaunchTemplateId(blankToNull(engine.resolve(specNode.path("LaunchTemplateId"))));
+                specification.setLaunchTemplateName(blankToNull(engine.resolve(specNode.path("LaunchTemplateName"))));
+                specification.setVersion(blankToNull(engine.resolve(specNode.path("Version"))));
+                launchTemplate.setLaunchTemplateSpecification(specification);
+            }
+            for (JsonNode overrideNode : launchTemplateNode.path("Overrides")) {
+                String instanceType = engine.resolve(overrideNode.path("InstanceType"));
+                if (instanceType != null && !instanceType.isBlank()) {
+                    var override = new MixedInstancesPolicy.LaunchTemplateOverride();
+                    override.setInstanceType(instanceType);
+                    launchTemplate.getOverrides().add(override);
+                }
+            }
+            policy.setLaunchTemplate(launchTemplate);
+        }
+
+        JsonNode distributionNode = policyNode.path("InstancesDistribution");
+        if (distributionNode.isObject()) {
+            var distribution = new MixedInstancesPolicy.InstancesDistribution();
+            distribution.setOnDemandBaseCapacity(
+                    parseOptionalInt(engine.resolve(distributionNode.path("OnDemandBaseCapacity"))));
+            distribution.setOnDemandPercentageAboveBaseCapacity(
+                    parseOptionalInt(engine.resolve(distributionNode.path("OnDemandPercentageAboveBaseCapacity"))));
+            distribution.setSpotAllocationStrategy(
+                    blankToNull(engine.resolve(distributionNode.path("SpotAllocationStrategy"))));
+            policy.setInstancesDistribution(distribution);
+        }
+        return policy;
+    }
+
+    private Integer parseOptionalInt(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private Map<String, String> resolveAsgTags(JsonNode props, CloudFormationTemplateEngine engine) {
@@ -961,6 +1027,109 @@ public class CloudFormationResourceProvisioner {
         }
         if (instance.getPlacement() != null && instance.getPlacement().getAvailabilityZone() != null) {
             r.getAttributes().put("AvailabilityZone", instance.getPlacement().getAvailabilityZone());
+        }
+    }
+
+    /**
+     * Provisions {@code AWS::EC2::LaunchTemplate} into {@link Ec2Service} so that Auto Scaling groups
+     * and instances in the same stack resolve it like they resolve a template created through the EC2
+     * API. Matching CloudFormation, {@code Ref} returns the launch template id, and the id, name and
+     * version numbers are exposed as {@code Fn::GetAtt} attributes.
+     */
+    private void provisionLaunchTemplate(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
+                                         String region, String accountId, String stackName) {
+        String name = resolveOptional(props, "LaunchTemplateName", engine);
+        if (name == null || name.isBlank()) {
+            name = generatePhysicalName(stackName, r.getLogicalId(), 128, false);
+        }
+        JsonNode data = props != null ? props.path("LaunchTemplateData") : null;
+        String encodedUserData = resolveOptional(data, "UserData", engine);
+
+        // Security groups reach launch template data either directly or through network interfaces,
+        // the same two places the EC2 Query API reads them from.
+        Set<String> securityGroupIds = new LinkedHashSet<>(resolveStringList(data, "SecurityGroupIds", engine));
+        if (data != null) {
+            for (JsonNode networkInterface : data.path("NetworkInterfaces")) {
+                securityGroupIds.addAll(resolveStringList(networkInterface, "Groups", engine));
+            }
+        }
+
+        var launchTemplate = ec2Service.createLaunchTemplate(region, name,
+                resolveOptional(data, "ImageId", engine),
+                resolveOptional(data, "InstanceType", engine),
+                resolveOptional(data, "KeyName", engine),
+                new ArrayList<>(securityGroupIds),
+                decodeUserData(encodedUserData),
+                encodedUserData,
+                resolveLaunchTemplateInstanceProfileArn(data, engine, accountId),
+                resolveEc2Tags(props, "TagSpecifications", "launch-template", engine),
+                resolveEc2Tags(data, "TagSpecifications", "instance", engine));
+
+        // Ref returns the launch template id; the version numbers back Fn::GetAtt.
+        r.setPhysicalId(launchTemplate.getLaunchTemplateId());
+        r.getAttributes().put("LaunchTemplateId", launchTemplate.getLaunchTemplateId());
+        r.getAttributes().put("LaunchTemplateName", launchTemplate.getLaunchTemplateName());
+        r.getAttributes().put("DefaultVersionNumber", launchTemplate.getDefaultVersionNumber());
+        r.getAttributes().put("LatestVersionNumber", launchTemplate.getLatestVersionNumber());
+    }
+
+    /**
+     * {@code IamInstanceProfile} in launch template data is an object carrying either an {@code Arn}
+     * or a {@code Name}; the EC2 API stores the ARN.
+     */
+    private String resolveLaunchTemplateInstanceProfileArn(JsonNode data, CloudFormationTemplateEngine engine,
+                                                           String accountId) {
+        if (data == null || !data.has("IamInstanceProfile")) {
+            return null;
+        }
+        JsonNode profile = data.get("IamInstanceProfile");
+        String arn = engine.resolve(profile.path("Arn"));
+        if (arn != null && !arn.isBlank()) {
+            return arn;
+        }
+        String profileName = engine.resolve(profile.path("Name"));
+        if (profileName == null || profileName.isBlank()) {
+            return null;
+        }
+        return AwsArnUtils.Arn.of("iam", "", accountId,
+                "instance-profile/" + profileName).toString();
+    }
+
+    /**
+     * Reads the tags of a single {@code TagSpecifications} entry, selected by its {@code ResourceType}.
+     */
+    private List<Tag> resolveEc2Tags(JsonNode props, String field, String resourceType,
+                                     CloudFormationTemplateEngine engine) {
+        List<Tag> tags = new ArrayList<>();
+        if (props == null || !props.has(field) || !props.get(field).isArray()) {
+            return tags;
+        }
+        for (JsonNode specification : props.get(field)) {
+            if (!resourceType.equals(engine.resolve(specification.path("ResourceType")))) {
+                continue;
+            }
+            for (JsonNode tag : specification.path("Tags")) {
+                String key = engine.resolve(tag.path("Key"));
+                if (!key.isEmpty()) {
+                    tags.add(new Tag(key, engine.resolve(tag.path("Value"))));
+                }
+            }
+        }
+        return tags;
+    }
+
+    /**
+     * Launch template user data is base64 in both CloudFormation and the EC2 API. Templates that pass
+     * it through unencoded are stored as-is rather than rejected.
+     */
+    private String decodeUserData(String encodedUserData) {
+        if (encodedUserData == null || encodedUserData.isBlank()) {
+            return null;
+        }
+        try {
+            return new String(Base64.getDecoder().decode(encodedUserData), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return encodedUserData;
         }
     }
 
@@ -3583,6 +3752,20 @@ public class CloudFormationResourceProvisioner {
                 throw e;
             }
             LOG.debugv("ECS task definition {0} already gone, treating delete as complete: {1}",
+                    physicalId, e.getMessage());
+        }
+    }
+
+    private void deleteLaunchTemplateSafe(String physicalId, String region) {
+        try {
+            ec2Service.deleteLaunchTemplate(region, physicalId, null);
+        } catch (AwsException e) {
+            // Idempotent delete: an already-missing template is delete-complete, so a rollback that
+            // re-deletes it does not turn into ROLLBACK_FAILED.
+            if (!"InvalidLaunchTemplateId.NotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            LOG.debugv("Launch template {0} already gone, treating delete as complete: {1}",
                     physicalId, e.getMessage());
         }
     }

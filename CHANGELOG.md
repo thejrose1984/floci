@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **iam:** seeded `AWSCloudTrail_FullAccess` and `AWSCloudTrail_ReadOnlyAccess` AWS managed policies.
 - **iam:** distinguish `s3:GetObjectAcl` / `s3:PutObjectAcl` / `s3:Get|Put|DeleteObjectTagging` from base S3 ops via `?acl` / `?tagging` query parameters when resolving an action for IAM enforcement.
 
+- **cloudformation:** provision `AWS::EC2::LaunchTemplate` into EC2 instead of stubbing it, so `Ref` returns the launch template id and `Fn::GetAtt` exposes `LaunchTemplateId`, `LaunchTemplateName`, `DefaultVersionNumber` and `LatestVersionNumber` ([#2005](https://github.com/floci-io/floci/issues/2005))
+
 ### Fixed
 
+- **cloudformation:** resolve `AWS::AutoScaling::AutoScalingGroup` launch templates by id as well as by name, and honor `MixedInstancesPolicy`, instead of failing with "The specified launch template does not exist." ([#2005](https://github.com/floci-io/floci/issues/2005))
 - **cloudformation:** report failed rollback cleanup as `ROLLBACK_FAILED`, detach removed IAM inline-policy targets on stack updates, and migrate the legacy managed-policy representation during update or deletion ([#1800](https://github.com/floci-io/floci/pull/1800))
 
 ## [1.5.33] - 2026-07-15

@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
 import io.quarkus.test.junit.QuarkusTest;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
@@ -11,20 +10,11 @@ import static org.hamcrest.Matchers.not;
 
 /**
  * Covers how AWS::AutoScaling::AutoScalingGroup resolves a launch template when it is provisioned
- * by CloudFormation.
+ * by CloudFormation: by name, by id, through a Ref to an in-stack AWS::EC2::LaunchTemplate, and
+ * through a MixedInstancesPolicy.
  *
- * <p>Only {@code LaunchTemplate.LaunchTemplateName} works today. The three disabled cases
- * reproduce <a href="https://github.com/floci-io/floci/issues/2005">#2005</a> and should be enabled
- * with the fix:
- *
- * <ul>
- *   <li>{@code LaunchTemplate.LaunchTemplateId} is passed to Auto Scaling in the launch template
- *       <em>name</em> slot, so the lookup misses even for a template that exists.</li>
- *   <li>{@code AWS::EC2::LaunchTemplate} is not a provisioned resource type, so {@code Ref} yields
- *       a synthetic {@code <LogicalId>-<hash>} physical id rather than an {@code lt-} id.</li>
- *   <li>{@code MixedInstancesPolicy} is not read from the template at all, so the group is created
- *       with no launch source.</li>
- * </ul>
+ * <p>Regression coverage for <a href="https://github.com/floci-io/floci/issues/2005">#2005</a>,
+ * where every shape but the by-name one failed with "The specified launch template does not exist".
  */
 @QuarkusTest
 class CloudFormationAsgLaunchTemplateIntegrationTest {
@@ -33,6 +23,10 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/cloudformation/aws4_request";
     private static final String EC2_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/ec2/aws4_request";
+    // Capacity is kept at zero throughout: launch template resolution is validated when the group is
+    // created, and launching instances would add ENIs that other tests in this suite count.
+    private static final String ASG_AUTH =
+            "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/autoscaling/aws4_request";
 
     /** Creates a launch template through the EC2 API and returns its {@code lt-} id. */
     private String createLaunchTemplate(String name) {
@@ -78,6 +72,19 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
             .extract().body().asString();
     }
 
+    private String describeAutoScalingGroup(String asgName) {
+        return given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", ASG_AUTH)
+            .formParam("Action", "DescribeAutoScalingGroups")
+            .formParam("AutoScalingGroupNames.member.1", asgName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().body().asString();
+    }
+
     private void assertStackCreated(String stackName) {
         String body = describeStacks(stackName);
         assertThat(body, containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
@@ -99,9 +106,9 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                       "Properties": {
                         "AutoScalingGroupName": "cfn-asg-name-%s",
                         "LaunchTemplate": {"LaunchTemplateName": "%s", "Version": "1"},
-                        "MinSize": 1,
-                        "MaxSize": 1,
-                        "DesiredCapacity": 1,
+                        "MinSize": 0,
+                        "MaxSize": 0,
+                        "DesiredCapacity": 0,
                         "AvailabilityZones": ["us-east-1a"]
                       }
                     }
@@ -110,10 +117,11 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                 """.formatted(suffix, ltName));
 
         assertStackCreated(stackName);
+        assertThat(describeAutoScalingGroup("cfn-asg-name-" + suffix),
+                containsString("<LaunchTemplateName>" + ltName + "</LaunchTemplateName>"));
     }
 
     @Test
-    @Disabled("Reproduces #2005: LaunchTemplateId is passed to Auto Scaling as a launch template name")
     void asgResolvesLaunchTemplateById() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String stackName = "cfn-lt-id-stack-" + suffix;
@@ -127,9 +135,9 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                       "Properties": {
                         "AutoScalingGroupName": "cfn-asg-id-%s",
                         "LaunchTemplate": {"LaunchTemplateId": "%s", "Version": "1"},
-                        "MinSize": 1,
-                        "MaxSize": 1,
-                        "DesiredCapacity": 1,
+                        "MinSize": 0,
+                        "MaxSize": 0,
+                        "DesiredCapacity": 0,
                         "AvailabilityZones": ["us-east-1a"]
                       }
                     }
@@ -138,10 +146,11 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                 """.formatted(suffix, ltId));
 
         assertStackCreated(stackName);
+        assertThat(describeAutoScalingGroup("cfn-asg-id-" + suffix),
+                containsString("<LaunchTemplateId>" + ltId + "</LaunchTemplateId>"));
     }
 
     @Test
-    @Disabled("Reproduces #2005: AWS::EC2::LaunchTemplate is stubbed, so Ref does not yield an lt- id")
     void asgResolvesInStackLaunchTemplateByRef() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String stackName = "cfn-lt-instack-stack-" + suffix;
@@ -164,9 +173,9 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                           "LaunchTemplateId": {"Ref": "Lt"},
                           "Version": {"Fn::GetAtt": ["Lt", "LatestVersionNumber"]}
                         },
-                        "MinSize": 1,
-                        "MaxSize": 1,
-                        "DesiredCapacity": 1,
+                        "MinSize": 0,
+                        "MaxSize": 0,
+                        "DesiredCapacity": 0,
                         "AvailabilityZones": ["us-east-1a"]
                       }
                     }
@@ -175,10 +184,12 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                 """.formatted(suffix, suffix));
 
         assertStackCreated(stackName);
+        // Ref must have yielded a real lt- id, not the synthetic physical id of a stubbed resource.
+        assertThat(describeAutoScalingGroup("cfn-asg-instack-" + suffix),
+                containsString("<LaunchTemplateId>lt-"));
     }
 
     @Test
-    @Disabled("Reproduces #2005: MixedInstancesPolicy is not read by the CloudFormation ASG provisioner")
     void asgResolvesMixedInstancesPolicyLaunchTemplate() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String ltName = "cfn-lt-mip-" + suffix;
@@ -198,9 +209,9 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                             "Overrides": [{"InstanceType": "t3.micro"}]
                           }
                         },
-                        "MinSize": 1,
-                        "MaxSize": 1,
-                        "DesiredCapacity": 1,
+                        "MinSize": 0,
+                        "MaxSize": 0,
+                        "DesiredCapacity": 0,
                         "AvailabilityZones": ["us-east-1a"]
                       }
                     }
@@ -209,5 +220,9 @@ class CloudFormationAsgLaunchTemplateIntegrationTest {
                 """.formatted(suffix, ltName));
 
         assertStackCreated(stackName);
+        String group = describeAutoScalingGroup("cfn-asg-mip-" + suffix);
+        assertThat(group, containsString("<MixedInstancesPolicy>"));
+        assertThat(group, containsString("<LaunchTemplateName>" + ltName + "</LaunchTemplateName>"));
+        assertThat(group, containsString("<InstanceType>t3.micro</InstanceType>"));
     }
 }

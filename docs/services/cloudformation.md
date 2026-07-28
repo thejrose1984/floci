@@ -62,7 +62,7 @@ cross-resource references.
 | ECS | `Cluster`, `TaskDefinition`, `Service` |
 | EKS | `Cluster`, `Nodegroup` |
 | RDS | `DBInstance`, `DBCluster`, `DBSubnetGroup`, `DBParameterGroup`, `DBClusterParameterGroup` (DBInstance/DBCluster start real containers) |
-| EC2 | `VPC`, `Subnet`, `SecurityGroup`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway`, `EIP`, `Instance` |
+| EC2 | `VPC`, `Subnet`, `SecurityGroup`, `InternetGateway`, `RouteTable`, `SubnetRouteTableAssociation`, `Route`, `NatGateway`, `EIP`, `Instance`, `LaunchTemplate` |
 | Elastic Load Balancing v2 | `LoadBalancer`, `TargetGroup`, `Listener`, `ListenerRule` |
 | Auto Scaling | `LaunchConfiguration`, `AutoScalingGroup` |
 | Route 53 | `HostedZone`, `RecordSet` |
@@ -83,6 +83,21 @@ cross-resource references.
 All other resource types are accepted without error and assigned a synthetic physical ID (with an
 `arn:aws:stub:::<logicalId>` ARN attribute), so templates with unsupported types still reach
 `CREATE_COMPLETE` rather than failing.
+
+## Launch Templates and Auto Scaling
+
+`AWS::EC2::LaunchTemplate` is provisioned into EC2, so a template declared in a stack is visible to
+`DescribeLaunchTemplates` and usable by resources that reference it. `Ref` returns the launch
+template id; `Fn::GetAtt` exposes `LaunchTemplateId`, `LaunchTemplateName`, `DefaultVersionNumber`
+and `LatestVersionNumber`.
+
+`AWS::AutoScaling::AutoScalingGroup` resolves its launch template through any of the shapes AWS
+accepts:
+
+- `LaunchTemplate` with `LaunchTemplateId` or `LaunchTemplateName` (plus `Version`)
+- `MixedInstancesPolicy` → `LaunchTemplate` → `LaunchTemplateSpecification`, including
+  `Overrides[].InstanceType` and `InstancesDistribution`
+- `LaunchConfigurationName`, referencing an `AWS::AutoScaling::LaunchConfiguration`
 
 ## Lambda Stack Updates
 
